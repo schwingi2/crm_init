@@ -1,29 +1,91 @@
-from flask import Flask, render_template, request, redirect, url_for, flash
-from models import Customer, Lead
-
+from flask import Flask, render_template, request, redirect, url_for, flash, session, jsonify
+from models import db, User, Customer, Lead 
+from functools import wraps
+from flasgger import Swagger
+    
 app = Flask(__name__)
-app.secret_key = 'your-secret-key-change-this'
 
-def init_sample_data():
-    Customer.add_customer('John Doe', 'john@example.com', 'Acme Corp', '555-0001', 'active')
-    Customer.add_customer('Jane Smith', 'jane@example.com', 'Tech Solutions', '555-0002', 'prospect')
-    Customer.add_customer('Bob Wilson', 'bob@example.com', 'Global Industries', '555-0003', 'inactive')
-    Lead.add_lead('Alice Brown', 'alice@example.com', 'StartUp Inc', 50000, 'Website')
-    Lead.add_lead('Charlie Davis', 'charlie@example.com', 'Enterprise Ltd', 100000, 'Referral')
+# --- Configuration ---
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///crm.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['SECRET_KEY'] = 'ihr-geheimschlüssel-hier'
 
-init_sample_data()
+# Initialize Database and Swagger
+db.init_app(app)
+swagger = Swagger(app)
+
+# --- RBAC Decorators ---
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not session.get('logged_in'):
+            flash('Bitte loggen Sie sich ein.', 'warning')
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+def admin_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if session.get('role') != 'admin':
+            flash('Zugriff verweigert: Admin-Rechte erforderlich!', 'danger')
+            return redirect(url_for('index'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+# --- Authentication Routes ---
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form.get('username')
+        password = request.form.get('password')
+        user = User.query.filter_by(username=username).first()
+        
+        if user and user.check_password(password):
+            session['logged_in'] = True
+            session['username'] = user.username
+            session['role'] = user.role
+            flash('Erfolgreich eingeloggt!', 'success')
+            return redirect(url_for('index'))
+        else:
+            flash('Ungültige Zugangsdaten!', 'danger')
+    return render_template('login.html')
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    flash('Erfolgreich abgemeldet.', 'info')
+    return redirect(url_for('login'))
 
 @app.route('/')
+@login_required
 def index():
-    total_customers = len(Customer.get_all_customers())
-    total_leads = len(Lead.get_all_leads())
-    return render_template('index.html', total_customers=total_customers, total_leads=total_leads)
+    # Basis-Statistiken abrufen
+    total_customers = Customer.query.count()
+    total_leads = Lead.query.count()
+    
+    # --- Sprint 3: Statistiken für das Dashboard-Diagramm ---
+    # Anzahl der aktiven Kunden ermitteln 
+    active_count = Customer.query.filter_by(status='active').count()
+    # Anzahl der Interessenten (Prospects) ermitteln 
+    prospect_count = Customer.query.filter_by(status='prospect').count()
+    
+    # Daten an das Frontend-Template übergeben
+    return render_template('index.html', 
+                           total_customers=total_customers, 
+                           total_leads=total_leads,
+                           active_count=active_count,
+                           prospect_count=prospect_count)
 
+# --- Customer Management Routes ---
 @app.route('/customers')
+@login_required
 def customers():
     return render_template('customers.html', customers=Customer.get_all_customers())
 
 @app.route('/customers/add', methods=['GET', 'POST'])
+@login_required
+@admin_required
 def add_customer():
     if request.method == 'POST':
         name = request.form.get('name')
@@ -31,50 +93,110 @@ def add_customer():
         company = request.form.get('company')
         phone = request.form.get('phone')
         status = request.form.get('status', 'prospect')
-
+        
         if not all([name, email, company, phone]):
-            flash('All fields are required!', 'error')
+            flash('Alle Felder sind Pflichtfelder!', 'error')
             return redirect(url_for('add_customer'))
-
+            
         Customer.add_customer(name, email, company, phone, status)
-        flash(f'Customer {name} added successfully!', 'success')
+        flash(f'Kunde {name} wurde hinzugefügt!', 'success')
         return redirect(url_for('customers'))
     return render_template('add_customer.html')
 
 @app.route('/customers/<int:customer_id>')
+@login_required
 def customer_detail(customer_id):
     customer = Customer.get_customer_by_id(customer_id)
     if not customer:
-        flash('Customer not found!', 'error')
+        flash('Kunde nicht gefunden!', 'error')
         return redirect(url_for('customers'))
     return render_template('customer_detail.html', customer=customer)
 
 @app.route('/customers/<int:customer_id>/edit', methods=['GET', 'POST'])
+@login_required
+@admin_required
 def edit_customer(customer_id):
     customer = Customer.get_customer_by_id(customer_id)
     if not customer:
-        flash('Customer not found!', 'error')
+        flash('Kunde nicht gefunden!', 'error')
         return redirect(url_for('customers'))
-
+        
     if request.method == 'POST':
-        Customer.update_customer(customer_id, request.form.get('name'), request.form.get('email'), 
-                                request.form.get('company'), request.form.get('phone'), request.form.get('status'))
-        flash('Customer updated successfully!', 'success')
-        return redirect(url_for('customer_detail', customer_id=customer_id))
-
+        customer.name = request.form.get('name')
+        customer.email = request.form.get('email')
+        customer.company = request.form.get('company')
+        customer.phone = request.form.get('phone')
+        customer.status = request.form.get('status')
+        db.session.commit()
+        flash('Kundendaten aktualisiert!', 'success')
+        return redirect(url_for('customer_detail', customer_id=customer.id))
     return render_template('edit_customer.html', customer=customer)
 
 @app.route('/customers/<int:customer_id>/delete', methods=['POST'])
+@login_required
+@admin_required
 def delete_customer(customer_id):
     Customer.delete_customer(customer_id)
-    flash('Customer deleted successfully!', 'success')
+    flash('Kunde gelöscht!', 'success')
     return redirect(url_for('customers'))
 
+# --- API Routes ---
+@app.route('/api/stats', methods=['GET'])
+def api_stats():
+    """
+    Abrufen der Systemstatistiken
+    ---
+    responses:
+      200:
+        description: Gibt die Anzahl der Kunden und Leads zurück
+    """
+    c_count = Customer.query.count()
+    l_count = Lead.query.count()
+    return jsonify({
+        "project": "USME_CRM_SYSTEM",
+        "data": {
+            "total_customers": c_count,
+            "total_leads": l_count
+        }
+    })
+
+@app.route('/api/customers', methods=['GET'])
+@login_required
+def get_customers_api():
+    """
+    Liste aller Kunden im JSON-Format
+    ---
+    responses:
+      200:
+        description: Eine Liste aller Kunden
+    """
+    customers_list = Customer.get_all_customers()
+    return jsonify([{
+        'id': c.id, 
+        'name': c.name, 
+        'email': c.email,
+        'company': c.company,
+        'status': c.status
+    } for c in customers_list])
+
+# --- Leads Routes ---
 @app.route('/leads')
+@login_required
 def leads():
     return render_template('leads.html', leads=Lead.get_all_leads())
 
+@app.route('/leads/<int:lead_id>')
+@login_required
+def lead_detail(lead_id):
+    lead = Lead.get_lead_by_id(lead_id)
+    if not lead:
+        flash('Lead nicht gefunden!', 'error')
+        return redirect(url_for('leads'))
+    return render_template('lead_detail.html', lead=lead)
+
 @app.route('/leads/add', methods=['GET', 'POST'])
+@login_required
+@admin_required
 def add_lead():
     if request.method == 'POST':
         name = request.form.get('name')
@@ -82,41 +204,63 @@ def add_lead():
         company = request.form.get('company')
         value = request.form.get('value')
         source = request.form.get('source')
-
-        if not all([name, email, company, value, source]):
-            flash('All fields are required!', 'error')
-            return redirect(url_for('add_lead'))
-
+        
         try:
             Lead.add_lead(name, email, company, float(value), source)
-            flash(f'Lead {name} added successfully!', 'success')
-        except ValueError:
-            flash('Deal value must be a number!', 'error')
-
+            flash(f'Lead {name} erfolgreich erstellt!', 'success')
+        except (ValueError, TypeError):
+            flash('Der Wert muss eine Zahl sein!', 'error')
         return redirect(url_for('leads'))
     return render_template('add_lead.html')
 
-@app.route('/leads/<int:lead_id>')
-def lead_detail(lead_id):
-    lead = Lead.get_lead_by_id(lead_id)
-    if not lead:
-        flash('Lead not found!', 'error')
-        return redirect(url_for('leads'))
-    return render_template('lead_detail.html', lead=lead)
-
 @app.route('/leads/<int:lead_id>/delete', methods=['POST'])
+@login_required
+@admin_required
 def delete_lead(lead_id):
     Lead.delete_lead(lead_id)
-    flash('Lead deleted successfully!', 'success')
+    flash('Lead gelöscht!', 'success')
     return redirect(url_for('leads'))
 
+# --- Error Handling ---
 @app.errorhandler(404)
 def page_not_found(error):
     return render_template('404.html'), 404
 
-@app.errorhandler(500)
-def internal_error(error):
-    return render_template('500.html'), 500
-
+# --- Main Entry Point ---
 if __name__ == '__main__':
+    with app.app_context():
+        # 1. Create tables
+        db.create_all()
+        
+        # 2. Create Admin user
+        if not User.query.filter_by(username='admin').first():
+            admin = User(username='admin', role='admin')
+            admin.set_password('password123')
+            db.session.add(admin)
+            print("Admin account created: admin / password123")
+            
+        # 3. Load demo data if database is empty
+        if not Customer.query.first():
+            customer_data = [
+                ('John Doe', 'john@example.com', 'Acme Corp', '555-0001', 'active'),
+                ('Jane Smith', 'jane@example.com', 'Tech Solutions', '555-0002', 'prospect'),
+                ('Max Mustermann', 'max@test.de', 'Berlin Tech', '030-12345', 'active'),
+                ('Erika Muster', 'erika@web.de', 'Muster AG', '089-98765', 'prospect'),
+                ('BMW Group', 'contact@bmw.de', 'Automotive', '089-11111', 'active'),
+                ('Siemens', 'info@siemens.com', 'Energy', '0911-2222', 'active')
+            ]
+            for n, e, c, p, s in customer_data:
+                Customer.add_customer(n, e, c, p, s)
+            
+            Lead.add_lead('Alice Brown', 'alice@example.com', 'StartUp Inc', 50000.0, 'Website')
+            Lead.add_lead('Portfolio Project', 'invest@finance.com', 'Global Invest', 250000.0, 'Referral')
+            print("Demo data loaded successfully.")
+            
+        db.session.commit()
+        print("CRM System is ready.")
+
+        
+       
+
+    # Start Server
     app.run(debug=True, host='127.0.0.1', port=5000)
